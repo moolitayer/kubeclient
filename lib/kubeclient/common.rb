@@ -82,51 +82,32 @@ module Kubeclient
       namespace.to_s.empty? ? '' : "namespaces/#{namespace}/"
     end
 
-    public
-
-    def self.define_entity_methods(entity_types)
-      entity_types.each do |klass, entity_type|
-        entity_name = entity_type.underscore
-        entity_name_plural = pluralize_entity(entity_name)
-
-        # get all entities of a type e.g. get_nodes, get_pods, etc.
-        define_method("get_#{entity_name_plural}") do |options = {}|
-          get_entities(entity_type, klass, options)
-        end
-
-        # watch all entities of a type e.g. watch_nodes, watch_pods, etc.
-        define_method("watch_#{entity_name_plural}") do |options = {}|
-          # This method used to take resource_version as a param, so
+    def method_missing(method_sym, *args, &block)
+      m  = method_sym.to_s.match(/^(get|watch|delete|create|update|patch)_(.*)$/)
+      if m
+        rest_method, entity_type = m[1], m[2].camelize # get, Pod or Pods
+        singular = entity_type.singularize
+        collection = singular != entity_type
+        method_name = [rest_method, collection ? 'entities' : 'entity'].join('_')
+        if collection
+          options = args[0] || {}
+          # This watch_entity method used to take resource_version as a param, so
           # this conversion is to keep backwards compatibility
           options = { resource_version: options } unless options.is_a?(Hash)
-
-          watch_entities(entity_type, options)
+          args = [singular, options]
+        else
+          args = [singular] + args
         end
-
-        # get a single entity of a specific type by name
-        define_method("get_#{entity_name}") do |name, namespace = nil|
-          get_entity(entity_type, klass, name, namespace)
-        end
-
-        define_method("delete_#{entity_name}") do |name, namespace = nil|
-          delete_entity(entity_type, name, namespace)
-        end
-
-        define_method("create_#{entity_name}") do |entity_config|
-          create_entity(entity_type, entity_config, klass)
-        end
-
-        define_method("update_#{entity_name}") do |entity_config|
-          update_entity(entity_type, entity_config)
-        end
-
-        define_method("patch_#{entity_name}") do |name, patch, namespace = nil|
-          patch_entity(entity_type, name, patch, namespace)
-        end
+        puts "calling: #{method_name}(#{args})"
+        send(method_name.to_sym, *args)
+      else
+        super
       end
     end
 
-    def self.pluralize_entity(entity_name)
+    public
+
+    def pluralize_entity(entity_name)
       return entity_name + 's' if entity_name.end_with? 'quota'
       entity_name.pluralize
     end
@@ -148,6 +129,7 @@ module Kubeclient
 
     def rest_client
       @rest_client ||= begin
+        puts "1. #{@api_endpoint.path}/#{@api_version}"
         create_rest_client("#{@api_endpoint.path}/#{@api_version}")
       end
     end
@@ -177,7 +159,7 @@ module Kubeclient
     #   :namespace - the namespace of the entity.
     #   :label_selector - a selector to restrict the list of returned objects by their labels.
     #   :field_selector - a selector to restrict the list of returned objects by their fields.
-    def get_entities(entity_type, klass, options = {})
+    def get_entities(entity_type, options = {})
       params = {}
       [:label_selector, :field_selector].each do |p|
         params[p.to_s.camelize(:lower)] = options[p] if options[p]
@@ -198,19 +180,19 @@ module Kubeclient
       end
 
       # result['items'] might be nil due to https://github.com/kubernetes/kubernetes/issues/13096
-      collection = result['items'].to_a.map { |item| new_entity(item, klass) }
+      collection = result['items'].to_a.map { |item| new_entity(item, entity_type) }
 
       Kubeclient::Common::EntityList.new(entity_type, resource_version, collection)
     end
 
-    def get_entity(entity_type, klass, name, namespace = nil)
+    def get_entity(entity_type, name, namespace = nil)
       ns_prefix = build_namespace_prefix(namespace)
       response = handle_exception do
         rest_client[ns_prefix + resource_name(entity_type) + "/#{name}"]
         .get(@headers)
       end
       result = JSON.parse(response)
-      new_entity(result, klass)
+      new_entity(result, entity_type)
     end
 
     def delete_entity(entity_type, name, namespace = nil)
@@ -221,7 +203,7 @@ module Kubeclient
       end
     end
 
-    def create_entity(entity_type, entity_config, klass)
+    def create_entity(entity_type, entity_config)
       # Duplicate the entity_config to a hash so that when we assign
       # kind and apiVersion, this does not mutate original entity_config obj.
       hash = entity_config.to_hash
@@ -245,7 +227,7 @@ module Kubeclient
         .post(hash.to_json, @headers)
       end
       result = JSON.parse(response)
-      new_entity(result, klass)
+      new_entity(result, entity_type)
     end
 
     def update_entity(entity_type, entity_config)
@@ -267,8 +249,23 @@ module Kubeclient
       end
     end
 
-    def new_entity(hash, klass)
-      klass.new(hash)
+    def new_entity(hash, entity_type)
+      resource_class(entity_type).new(hash)
+    end
+
+    def resource_class(entity_type)
+      # TODO: test binding since there already seems to be a constant with that name
+      Kubeclient.const_get(entity_type)
+      rescue NameError
+        Kubeclient.const_set(
+          entity_type,
+          Class.new(RecursiveOpenStruct) do
+            def initialize(hash = nil, args = {})
+              args.merge!(recurse_over_arrays: true)
+              super(hash, args)
+            end
+          end
+        )
     end
 
     def retrieve_all_entities(entity_types)
@@ -321,7 +318,7 @@ module Kubeclient
     end
 
     def resource_name(entity_type)
-      ClientMixin.pluralize_entity entity_type.downcase
+      pluralize_entity entity_type.downcase
     end
 
     def api_valid?
