@@ -26,6 +26,12 @@ module Kubeclient
 
     DEFAULT_HTTP_PROXY_URI = nil
 
+    CORE_API = 'api'
+    OS_API = 'oapi'
+    GROUP_API = 'apis'
+    APIS = [CORE_API, OS_API, GROUP_API]
+
+
     attr_reader :api_endpoint
     attr_reader :ssl_options
     attr_reader :auth_options
@@ -59,12 +65,75 @@ module Kubeclient
       end
     end
 
+    def discover
+      groups = []
+      if @api_endpoint.path.end_with?(GROUP_API)
+        groups += discover_groups # Parse a
+      else
+        groups = [''] # the core group
+      end
+      groups.each {|group| discover_resources(group)}
+    end
+
+    def discover_groups
+      response = JSON.parse(rest_client['/'].get(@headers))
+      puts "response #{response}"
+      # APIGroupList
+      response["groups"].each do |group|
+        group["versions"].each do |version|
+          if version["version"] == @api_version
+            puts "group: #{group} version: #{version}"
+          end
+        end
+      end
+    end
+
+    def discover_resources(group)
+      # discover resources of APIResourceList found and api/version or apis/group/version
+      puts "discover_resources: group #{group}"
+      # if group == ''
+      #
+      # end
+      response = JSON.parse(rest_client['/'].get(@headers)) # only correct for core group
+      response["resources"].each do |resource|
+        define_resource(group, resource["name"], resource["kind"])
+      end
+      puts "response #{response}"
+    end
+
+    def define_resource(group, name, kind)
+      # Example1 name= componentstatuses, kind = ComponentStatus
+      # Example1 name= namespaces/finalize, kind = Namespace
+      puts "Group: #{group} Name: #{name} Kind: #{kind}"
+      # Dynamically creating classes definitions (class Pod, class Service, etc.),
+      # The classes are extending RecursiveOpenStruct.
+
+      define_class
+
+      define_entity_methods(clazz, kind)
+    end
+
+    def define_class
+      Kubeclient.const_get(kind)
+    except_
+
+      clazz = Class.new(RecursiveOpenStruct) do
+        def initialize(hash = nil, args = {})
+          args.merge!(recurse_over_arrays: true)
+          super(hash, args)
+        end
+      end
+      [Kubeclient.const_set(kind, clazz), kind]
+
+    end
+
     def handle_exception
       yield
     rescue RestClient::Exception => e
       json_error_msg = begin
         JSON.parse(e.response || '') || {}
       rescue JSON::ParserError
+        # TODO: return a meaningful parse error {'message' => e.message}
         {}
       end
       err_message = json_error_msg['message'] || e.message
@@ -82,49 +151,48 @@ module Kubeclient
       namespace.to_s.empty? ? '' : "namespaces/#{namespace}/"
     end
 
-    public
+    def define_entity_methods(klass, entity_type)
+      entity_name = entity_type.underscore
+      entity_name_plural = pluralize_entity(entity_name)
 
-    def self.define_entity_methods(entity_types)
-      entity_types.each do |klass, entity_type|
-        entity_name = entity_type.underscore
-        entity_name_plural = pluralize_entity(entity_name)
+      # get all entities of a type e.g. get_nodes, get_pods, etc.
+      define_method("get_#{entity_name_plural}") do |options = {}|
+        get_entities(entity_type, klass, options)
+      end
 
-        # get all entities of a type e.g. get_nodes, get_pods, etc.
-        define_method("get_#{entity_name_plural}") do |options = {}|
-          get_entities(entity_type, klass, options)
-        end
+      # watch all entities of a type e.g. watch_nodes, watch_pods, etc.
+      define_method("watch_#{entity_name_plural}") do |options = {}|
+        # This method used to take resource_version as a param, so
+        # this conversion is to keep backwards compatibility
+        options = { resource_version: options } unless options.is_a?(Hash)
 
-        # watch all entities of a type e.g. watch_nodes, watch_pods, etc.
-        define_method("watch_#{entity_name_plural}") do |options = {}|
-          # This method used to take resource_version as a param, so
-          # this conversion is to keep backwards compatibility
-          options = { resource_version: options } unless options.is_a?(Hash)
+        watch_entities(entity_type, options)
+      end
 
-          watch_entities(entity_type, options)
-        end
+      # get a single entity of a specific type by name
+      define_method("get_#{entity_name}") do |name, namespace = nil|
+        get_entity(entity_type, klass, name, namespace)
+      end
 
-        # get a single entity of a specific type by name
-        define_method("get_#{entity_name}") do |name, namespace = nil|
-          get_entity(entity_type, klass, name, namespace)
-        end
+      define_method("delete_#{entity_name}") do |name, namespace = nil|
+        delete_entity(entity_type, name, namespace)
+      end
 
-        define_method("delete_#{entity_name}") do |name, namespace = nil|
-          delete_entity(entity_type, name, namespace)
-        end
+      define_method("create_#{entity_name}") do |entity_config|
+        create_entity(entity_type, entity_config, klass)
+      end
 
-        define_method("create_#{entity_name}") do |entity_config|
-          create_entity(entity_type, entity_config, klass)
-        end
+      define_method("update_#{entity_name}") do |entity_config|
+        update_entity(entity_type, entity_config)
+      end
 
-        define_method("update_#{entity_name}") do |entity_config|
-          update_entity(entity_type, entity_config)
-        end
-
-        define_method("patch_#{entity_name}") do |name, patch, namespace = nil|
-          patch_entity(entity_type, name, patch, namespace)
-        end
+      define_method("patch_#{entity_name}") do |name, patch, namespace = nil|
+        patch_entity(entity_type, name, patch, namespace)
       end
     end
+
+
+    public
 
     def self.pluralize_entity(entity_name)
       return entity_name + 's' if entity_name.end_with? 'quota'
@@ -148,6 +216,7 @@ module Kubeclient
 
     def rest_client
       @rest_client ||= begin
+        puts "1. #{@api_endpoint.path}/#{@api_version}"
         create_rest_client("#{@api_endpoint.path}/#{@api_version}")
       end
     end
