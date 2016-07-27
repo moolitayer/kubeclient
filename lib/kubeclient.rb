@@ -17,12 +17,14 @@ module Kubeclient
     def initialize(
       uri,
       version = 'v1',
+      group = '',
       **options
     )
       initialize_client(
         uri,
         '/api',
         version,
+        group,
         options
       )
     end

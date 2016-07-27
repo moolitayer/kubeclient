@@ -26,6 +26,12 @@ module Kubeclient
 
     DEFAULT_HTTP_PROXY_URI = nil
 
+    CORE_API = 'api'
+    OS_API = 'oapi'
+    GROUP_API = 'apis'
+    APIS = [CORE_API, OS_API, GROUP_API]
+
+
     attr_reader :api_endpoint
     attr_reader :ssl_options
     attr_reader :auth_options
@@ -36,21 +42,24 @@ module Kubeclient
       uri,
       path,
       version,
+      group,
       ssl_options: DEFAULT_SSL_OPTIONS,
       auth_options: DEFAULT_AUTH_OPTIONS,
       socket_options: DEFAULT_SOCKET_OPTIONS,
       http_proxy_uri: DEFAULT_HTTP_PROXY_URI
     )
       validate_auth_options(auth_options)
-      handle_uri(uri, path)
+      handle_uri(uri, path, group)
 
       @api_version = version
+      @group = group
       @headers = {}
       @ssl_options = ssl_options
       @auth_options = auth_options
       @socket_options = socket_options
       @http_proxy_uri = http_proxy_uri.to_s if http_proxy_uri
 
+      @group = group + '/' unless group.empty?
       if auth_options[:bearer_token]
         bearer_token(@auth_options[:bearer_token])
       elsif auth_options[:bearer_token_file]
@@ -71,11 +80,13 @@ module Kubeclient
       raise KubeException.new(e.http_code, err_message, e.response)
     end
 
-    def handle_uri(uri, path)
+    def handle_uri(uri, path, group)
       fail ArgumentError, 'Missing uri' unless uri
       @api_endpoint = (uri.is_a?(URI) ? uri : URI.parse(uri))
       @api_endpoint.path = path if @api_endpoint.path.empty?
       @api_endpoint.path = @api_endpoint.path.chop if @api_endpoint.path.end_with? '/'
+      fail ArgumentError, "Bad path: #{@api_endpoint.path}" unless APIS.include?(@api_endpoint.path[1..-1])
+      fail ArgumentError, "Bad path: No group allowed" if !group.empty? && @api_endpoint.path[1..-1] != GROUP_API
     end
 
     def build_namespace_prefix(namespace)
@@ -114,6 +125,7 @@ module Kubeclient
 
     def create_rest_client(path = nil)
       path ||= @api_endpoint.path
+      puts "path: #{path}"
       options = {
         ssl_ca_file: @ssl_options[:ca_file],
         ssl_cert_store: @ssl_options[:cert_store],
@@ -129,8 +141,7 @@ module Kubeclient
 
     def rest_client
       @rest_client ||= begin
-        puts "1. #{@api_endpoint.path}/#{@api_version}"
-        create_rest_client("#{@api_endpoint.path}/#{@api_version}")
+        create_rest_client("#{@api_endpoint.path}/#{@group}#{@api_version}")
       end
     end
 
@@ -220,9 +231,10 @@ module Kubeclient
       else
         hash[:kind] = entity_type
       end
-      hash[:apiVersion] = @api_version
+      hash[:apiVersion] = @group + @api_version
       @headers['Content-Type'] = 'application/json'
       response = handle_exception do
+        puts rest_client[ns_prefix + resource_name(entity_type)]
         rest_client[ns_prefix + resource_name(entity_type)]
         .post(hash.to_json, @headers)
       end
