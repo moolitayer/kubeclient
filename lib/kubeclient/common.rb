@@ -72,59 +72,76 @@ module Kubeclient
       else
         groups = [''] # the core group
       end
+      puts "Groups: #{groups}"
       groups.each {|group| discover_resources(group)}
     end
 
     def discover_groups
-      response = JSON.parse(rest_client['/'].get(@headers))
+      @groups
+      response = JSON.parse(create_rest_client("#{@api_endpoint.path}").get(@headers))
       puts "response #{response}"
       # APIGroupList
       response["groups"].each do |group|
+        group_name = group["name"]
         group["versions"].each do |version|
           if version["version"] == @api_version
-            puts "group: #{group} version: #{version}"
+            klass = define_class(group_name.camelize)
+            ClientMixin.define_resource_methods(
+              define_class(kind),
+              kind
+            )
+
+            # self.group["name"]
+            klass.define_method(group_name) do
+              define_class(group_name.camelize).new
+            end
           end
         end
       end
+
+      @group_proxies.keys
     end
 
     def discover_resources(group)
       # discover resources of APIResourceList found and api/version or apis/group/version
       puts "discover_resources: group #{group}"
-      # if group == ''
+      #
       #
       # end
-      response = JSON.parse(rest_client['/'].get(@headers)) # only correct for core group
+      discovery_path = "#{@api_endpoint.path}#{group == '' ? '' :'/' + group}/#{@api_version}"
+
+      response = JSON.parse(create_rest_client(discovery_path).get(@headers)) # only correct for core group
       response["resources"].each do |resource|
         define_resource(group, resource["name"], resource["kind"])
       end
-      puts "response #{response}"
     end
 
     def define_resource(group, name, kind)
       # Example1 name= componentstatuses, kind = ComponentStatus
       # Example1 name= namespaces/finalize, kind = Namespace
-      puts "Group: #{group} Name: #{name} Kind: #{kind}"
+      puts "define_resource: Group: #{group} Name: #{name} Kind: #{kind}"
       # Dynamically creating classes definitions (class Pod, class Service, etc.),
       # The classes are extending RecursiveOpenStruct.
-
-      define_class
-
-      define_entity_methods(clazz, kind)
+      ClientMixin.define_resource_methods(
+        define_class(kind),
+        kind
+      )
     end
 
-    def define_class
+    def define_class(kind)
+      raise NameError.new if kind == "Binding" # Hack to deal with the fact that a binding class is already defined
+
       Kubeclient.const_get(kind)
-    except_
-
-      clazz = Class.new(RecursiveOpenStruct) do
-        def initialize(hash = nil, args = {})
-          args.merge!(recurse_over_arrays: true)
-          super(hash, args)
-        end
-      end
-      [Kubeclient.const_set(kind, clazz), kind]
-
+      rescue NameError
+        Kubeclient.const_set(
+          kind,
+          Class.new(RecursiveOpenStruct) do
+            def initialize(hash = nil, args = {})
+              args.merge!(recurse_over_arrays: true)
+              super(hash, args)
+            end
+          end
+        )
     end
 
     def handle_exception
@@ -151,7 +168,13 @@ module Kubeclient
       namespace.to_s.empty? ? '' : "namespaces/#{namespace}/"
     end
 
-    def define_entity_methods(klass, entity_type)
+    def self.define_group_methods(group_name)
+      define_method(group_name) do
+        define_class(group_name).new
+      end
+    end
+
+    def self.define_resource_methods(klass, entity_type)
       entity_name = entity_type.underscore
       entity_name_plural = pluralize_entity(entity_name)
 
@@ -454,5 +477,6 @@ module Kubeclient
 
       options.merge(@socket_options)
     end
+
   end
 end
